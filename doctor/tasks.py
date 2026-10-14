@@ -1,25 +1,32 @@
 import asyncio
 import base64
+import fnmatch
+import hashlib
 import io
+import logging
 import os
 import re
-import subprocess
+import time
 from collections.abc import ByteString
 from tempfile import NamedTemporaryFile
 from typing import Any, AnyStr
+from urllib.parse import urlparse
 
 import eyed3
+import httpx2
 import magic
 import pdfplumber
-import requests
 import xray
+from django.conf import settings
 from eyed3 import id3
+from httpx2 import AsyncClient
 from lxml.html.clean import Cleaner
 from PIL.Image import Image
-from PyPDF2 import PdfReader
-from PyPDF2.errors import PdfReadError
+from pypdf import PdfReader
+from pypdf.errors import PdfReadError
 from seal_rookery.search import ImageSizes, seal
 
+from doctor.lib.bitonal import BitonalError
 from doctor.lib.mojibake import fix_mojibake
 from doctor.lib.text_extraction import (
     extract_with_ocr,
@@ -33,6 +40,8 @@ from doctor.lib.utils import (
     ocr_needed,
     smart_text,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def pdf_bytes_from_images(image_list: list[Image]):
@@ -55,30 +64,45 @@ def pdf_bytes_from_images(image_list: list[Image]):
     return pdf_data
 
 
-def make_pdftotext_process(path):
+async def make_pdftotext_process(path):
     """Make a subprocess to hand to higher-level code.
 
     :param path: File location
     :return: Subprocess results
     """
 
-    process = subprocess.Popen(
-        ["pdftotext", "-layout", "-enc", "UTF-8", path, "-"],
+    process = await asyncio.create_subprocess_exec(
+        "pdftotext",
+        "-layout",
+        "-enc",
+        "UTF-8",
+        path,
+        "-",
         shell=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
     )
-    content, err = process.communicate()
+    content, err = await process.communicate()
     return content.decode(), err, process.returncode
 
 
-def rasterize_pdf(path, destination):
-    """Convert the PDF into a multipage Tiff file.
+async def rasterize_pdf(
+    path: str,
+    destination: str,
+    first_page: int | None = None,
+    last_page: int | None = None,
+):
+    """Convert the PDF, or a page range of it, into a multipage Tiff file.
 
     This function uses ghostscript for processing and borrows heavily from:
 
         https://github.com/jbarlow83/OCRmyPDF/blob/636d1903b35fed6b07a01af53769fea81f388b82/ocrmypdf/ghostscript.py#L11
 
+    :param path: The PDF to rasterize
+    :param destination: Where to write the TIFF
+    :param first_page: 1-based first page to render; None means page 1
+    :param last_page: 1-based last page to render; None means the last page
+    :return: ghostscript's stdout, stderr and return code
     """
     # gs docs, see: http://ghostscript.com/doc/7.07/Use.htm
     # gs devices, see: http://ghostscript.com/doc/current/Devices.htm
@@ -98,30 +122,31 @@ def rasterize_pdf(path, destination):
         "-sDEVICE=tiffgray",
         "-sCompression=lzw",
         "-r300x300",  # Set the resolution to 300 DPI.
-        "-o",
-        destination,
-        path,
     ]
+    if first_page is not None:
+        gs.append(f"-dFirstPage={first_page}")
+    if last_page is not None:
+        gs.append(f"-dLastPage={last_page}")
+    gs += ["-o", destination, path]
 
-    p = subprocess.Popen(
-        gs,
+    p = await asyncio.create_subprocess_exec(
+        *gs,
         close_fds=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        universal_newlines=True,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = p.communicate()
+    stdout, stderr = await p.communicate()
     return stdout, stderr, p.returncode
 
 
-def get_xray(path):
+async def get_xray(path):
     """Get bad redactions
 
     :param path: A path to the file
     :return: dictionary of bounding boxes.
     """
     try:
-        bad_redactions = xray.inspect(path)
+        bad_redactions = await xray.inspect(path)
         return bad_redactions
     except (
         OSError,
@@ -173,9 +198,10 @@ def get_page_count(path, extension):
     return None
 
 
-def extract_from_pdf(
+async def extract_from_pdf(
     path: str,
     ocr_available: bool = False,
+    page_count: int | None = None,
 ) -> Any:
     """Extract text from pdfs.
 
@@ -188,9 +214,11 @@ def extract_from_pdf(
 
     :param path: The path to the PDF
     :param ocr_available: Whether we should do OCR stuff
+    :param page_count: The document's page count if the caller already has
+        it, so OCR does not parse the PDF again; None to look it up
     :return Tuple of the content itself and any errors we received
     """
-    content, err, returncode = make_pdftotext_process(path)
+    content, err, returncode = await make_pdftotext_process(path)
     extracted_by_ocr = False
     if err is not None:
         err = err.decode()
@@ -201,7 +229,7 @@ def extract_from_pdf(
             content = fix_mojibake(content)
     else:
         if ocr_needed(path, content):
-            success, ocr_content = extract_by_ocr(path)
+            success, ocr_content = await extract_by_ocr(path, page_count)
             if success:
                 # Check content length and take the longer of the two
                 if len(ocr_content) > len(content):
@@ -214,22 +242,133 @@ def extract_from_pdf(
     return content, err, returncode, extracted_by_ocr
 
 
-def extract_by_ocr(path: str) -> (bool, str):
+OCR_FAIL_MSG = (
+    "Unable to extract the content from this file. Please try "
+    "reading the original."
+)
+
+# Tesseract separates the pages of a multi-page TIFF with a form feed and
+# emits none after the last page, so joining the slices with one gives the
+# same text as a single pass over the whole document.
+OCR_PAGE_SEPARATOR = "\f"
+
+
+async def extract_by_ocr(
+    path: str, page_count: int | None = None
+) -> tuple[bool, str]:
     """Extract the contents of a PDF using OCR.
 
+    The document is rasterized and OCRed in slices of
+    ``settings.DOCTOR_OCR_PAGES_PER_SLICE`` pages, one slice at a time, so
+    ghostscript, tesseract and /tmp each hold at most one slice however
+    long the document is. A document that fits in one slice takes a
+    single pass, as does one whose page count pypdf cannot read.
+
+    The slice boundaries come from pypdf's page count, but the count is
+    not trusted to be the end of the document: the last slice is left
+    open-ended so ghostscript renders every page it finds past the count,
+    and the loop stops early if ghostscript finds no pages in a slice.
+    No page is lost when pypdf and ghostscript disagree on the count.
+
     :param path: The path to the file
+    :param page_count: The page count if the caller already has it; None
+        to read it with pypdf
     :return Tuple with success or fail boolean and text
     """
-    fail_msg = (
-        "Unable to extract the content from this file. Please try "
-        "reading the original."
-    )
-    with NamedTemporaryFile(prefix="ocr_", suffix=".tiff", buffering=0) as tmp:
-        out, err, returncode = rasterize_pdf(path, tmp.name)
-        if returncode != 0:
-            return False, fail_msg
+    pages_per_slice = max(1, settings.DOCTOR_OCR_PAGES_PER_SLICE)
+    if page_count is None:
+        page_count = get_page_count(path, "pdf")
+    page_count = page_count or 0
+    if page_count <= pages_per_slice:
+        success, text = await _ocr_page_range(path)
+        return success, text or ""
 
-        txt = convert_file_to_txt(tmp.name)
+    parts: list[str] = []
+    for first in range(1, page_count + 1, pages_per_slice):
+        last = first + pages_per_slice - 1
+        if last >= page_count:
+            # Render through the real end of the file, wherever it is.
+            last = None
+        last_label = last if last is not None else "end"
+        started = time.monotonic()
+        success, text = await _ocr_page_range(path, first, last)
+        if not success:
+            logger.warning(
+                "OCR failed on pages %d-%s of %d of %s",
+                first,
+                last_label,
+                page_count,
+                path,
+            )
+            return False, OCR_FAIL_MSG
+        if text is None:
+            logger.warning(
+                "pypdf counted %d pages in %s but ghostscript found none "
+                "from page %d; stopping there",
+                page_count,
+                path,
+                first,
+            )
+            break
+        logger.info(
+            "OCRed pages %d-%s of %d of %s in %.1fs, %d chars",
+            first,
+            last_label,
+            page_count,
+            path,
+            time.monotonic() - started,
+            len(text),
+        )
+        parts.append(text)
+        if last is None:
+            break
+    return True, OCR_PAGE_SEPARATOR.join(parts)
+
+
+async def _ocr_page_range(
+    path: str,
+    first_page: int | None = None,
+    last_page: int | None = None,
+) -> tuple[bool, str | None]:
+    """Rasterize one page range to a temporary TIFF and OCR it.
+
+    The TIFF is removed when this returns, so only one range's worth of
+    pixels is ever on disk.
+
+    :param path: The path to the PDF
+    :param first_page: 1-based first page, None for the whole document
+    :param last_page: 1-based last page, None for the whole document; a
+        last page past the end of the document renders up to the end
+    :return (False, message) if ghostscript or tesseract failed; (True,
+        None) if the range starts past the end of the document, so
+        ghostscript rendered no pages; otherwise (True, text)
+    """
+    with NamedTemporaryFile(prefix="ocr_", suffix=".tiff", buffering=0) as tmp:
+        out, err, returncode = await rasterize_pdf(
+            path, tmp.name, first_page, last_page
+        )
+        if returncode != 0:
+            return False, OCR_FAIL_MSG
+        if os.path.getsize(tmp.name) == 0:
+            # ghostscript exits 0 with no output when first_page is past
+            # the last page of the document.
+            return True, None
+
+        txt, err, returncode = await convert_file_to_txt(tmp.name)
+        if returncode != 0:
+            # A crashed or killed tesseract leaves stdout empty. Treating
+            # that as text would leave a silent gap of this range's pages
+            # in an otherwise complete document, so fail the same way a
+            # ghostscript failure does.
+            logger.warning(
+                "tesseract exited %d on pages %s-%s of %s: %s",
+                returncode,
+                first_page or 1,
+                last_page or "end",
+                path,
+                err.strip()[-500:],
+            )
+            return False, OCR_FAIL_MSG
         txt = cleanup_ocr_text(txt)
 
     return True, txt
@@ -252,11 +391,11 @@ def cleanup_ocr_text(txt: str) -> str:
     return txt
 
 
-def convert_file_to_txt(path: str) -> str:
-    """Converts a file to plain text
+async def convert_file_to_txt(path: str) -> tuple[str, str, int | None]:
+    """Converts a file to plain text with tesseract
 
     :param path: The path to the file
-    :return The extracted text content from the file
+    :return The extracted text, tesseract's stderr and its return code
     """
     tesseract_command = [
         "tesseract",
@@ -267,10 +406,13 @@ def convert_file_to_txt(path: str) -> str:
         "-c",
         "tessedit_do_invert=0",  # Assume a white background for speed
     ]
-    p = subprocess.Popen(
-        tesseract_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    p = await asyncio.create_subprocess_exec(
+        *tesseract_command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
     )
-    return p.communicate()[0].decode()
+    out, err = await p.communicate()
+    return out.decode(), err.decode(errors="replace"), p.returncode
 
 
 def convert_tiff_to_pdf_bytes(single_tiff_image: Image) -> ByteString:
@@ -293,37 +435,42 @@ def convert_tiff_to_pdf_bytes(single_tiff_image: Image) -> ByteString:
     return pdf_bytes
 
 
-def extract_from_doc(path) -> tuple[str, bytes, int]:
+async def extract_from_doc(path) -> tuple[str, bytes, int | None]:
     """Extract text from docs.
     We use antiword to pull the text out of MS Doc files.
 
     :param path: The path to the file
     :return: A tuple containing the extracted text, any error output, and the subprocess return code
     """
-    process = subprocess.Popen(
-        ["antiword", path, "-i", "1"],
+    process = await asyncio.create_subprocess_exec(
+        "antiword",
+        path,
+        "-i",
+        "1",
         shell=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
     )
-    content, err = process.communicate()
+    content, err = await process.communicate()
     return content.decode("utf-8"), err, process.returncode
 
 
-def extract_from_docx(path) -> tuple[str, bytes, int]:
+async def extract_from_docx(path) -> tuple[str, bytes, int | None]:
     """Extract text from docx files
     We use docx2txt to pull out the text. Pretty simple.
 
     :param path: The path to the .docx file
     :return: A tuple containing the extracted text, any error output (empty bytes), and the subprocess return code
     """
-    process = subprocess.Popen(
-        ["docx2txt", path, "-"],
+    process = await asyncio.create_subprocess_exec(
+        "docx2txt",
+        path,
+        "-",
         shell=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
     )
-    content, err = process.communicate()
+    content, err = await process.communicate()
     return content.decode("utf-8"), err, process.returncode
 
 
@@ -403,7 +550,7 @@ def extract_from_txt(filepath: str):
     return content, err, error_code
 
 
-def extract_from_wpd(path: str) -> tuple[str, bytes, int]:
+async def extract_from_wpd(path: str) -> tuple[str, bytes, int | None]:
     """Extract text from a Word Perfect file
 
     Yes, courts still use these, so we extract their text using wpd2html. Once
@@ -416,42 +563,295 @@ def extract_from_wpd(path: str) -> tuple[str, bytes, int]:
              - The standard error output from the wpd2html subprocess (bytes)
              - The return code of the wpd2html subprocess (int). Returns 1 on Python-level errors
     """
-    process = subprocess.Popen(
-        ["wpd2html", path],
+    process = await asyncio.create_subprocess_exec(
+        "wpd2html",
+        path,
         shell=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
     )
-    content_bytes, err = process.communicate()
+    content_bytes, err = await process.communicate()
     content_str = content_bytes.decode("utf-8")
     content = get_clean_body_content(content_str)
 
     return content, err, process.returncode
 
 
-def download_images(sorted_urls) -> list:
-    """Download images and convert to list of PIL images
+MAX_IMAGE_BYTES = 100 * 1024 * 1024  # 100 MB per image
+MAX_CONCURRENT_IMAGE_DOWNLOADS = 10
 
-    Once in an array of PIL.images we can easily convert this to a PDF.
+# Presigned URL transport for the bitonal endpoint. Transient
+# failures (network errors, 5xx) are retried with backoff; a 403
+# means the presigned signature expired, so retrying the same URL
+# cannot succeed and the caller must re-presign.
+EGRESS_MAX_ATTEMPTS = 3
+EGRESS_BACKOFF_SECONDS = 1.0
+EGRESS_TIMEOUT = httpx2.Timeout(30.0, connect=10.0)
+
+
+def validate_egress_url(url: str) -> None:
+    """Check a caller-supplied URL against the egress policy.
+
+    When DOCTOR_EGRESS_ALLOWED_HOSTS is set, the URL must be https
+    and its host must match one of the configured fnmatch patterns.
+    An empty setting disables the check.
+
+    :param url: The URL doctor was asked to fetch from or upload to.
+    :raises BitonalError: EGRESS_BLOCKED when the URL is not allowed.
+    """
+    allowed_hosts = settings.DOCTOR_EGRESS_ALLOWED_HOSTS
+    if not allowed_hosts:
+        return
+    parsed = urlparse(url)
+    hostname = parsed.hostname or ""
+    if parsed.scheme != "https" or not any(
+        fnmatch.fnmatch(hostname, pattern) for pattern in allowed_hosts
+    ):
+        raise BitonalError(
+            "EGRESS_BLOCKED",
+            f"URL blocked by egress policy: {parsed.scheme}://{hostname}",
+            status=400,
+        )
+
+
+class _TransientTransferError(Exception):
+    """A transfer failure worth retrying: a network error or a 5xx."""
+
+
+def _classify_status(
+    status: int, expired_code: str, failed_code: str, direction: str
+) -> None:
+    """Raise for any non-2xx response, classified for retry policy.
+
+    2xx passes. 403 means the presigned signature expired: retrying
+    the same URL cannot succeed, so it fails fast with expired_code.
+    5xx is transient and retried. Everything else — including 3xx,
+    which follow_redirects=False hands back as-is and which must
+    never count as a completed transfer — fails fast with
+    failed_code.
+
+    :param status: The HTTP status code of the response.
+    :param expired_code: Error code for an expired signature (403).
+    :param failed_code: Error code for other terminal failures.
+    :param direction: "input" or "output", for the error message.
+    """
+    if 200 <= status < 300:
+        return
+    if status == 403:
+        raise BitonalError(
+            expired_code,
+            f"{direction} URL returned 403; the signature has expired "
+            "and a retry cannot succeed",
+            status=502,
+        )
+    if status >= 500:
+        raise _TransientTransferError(f"HTTP {status}")
+    raise BitonalError(
+        failed_code,
+        f"{direction} URL returned HTTP {status}",
+        status=502,
+    )
+
+
+def _transfer_with_retries(attempt, failed_code: str, failure_prefix: str):
+    """Run one transfer attempt under the shared retry/backoff policy.
+
+    Retries _TransientTransferError and httpx2 transport errors with
+    exponential backoff. BitonalError — the fail-fast
+    classifications from _classify_status — propagates immediately,
+    and a malformed URL (httpx2.InvalidURL) fails fast as a terminal
+    4xx with failed_code.
+
+    :param attempt: Zero-argument callable performing one attempt.
+    :param failed_code: Error code raised when attempts are exhausted.
+    :param failure_prefix: Human prefix for the exhaustion message.
+    :return: Whatever attempt() returns.
+    """
+    last_error = ""
+    for attempt_number in range(EGRESS_MAX_ATTEMPTS):
+        if attempt_number:
+            time.sleep(EGRESS_BACKOFF_SECONDS * 2 ** (attempt_number - 1))
+        try:
+            return attempt()
+        except httpx2.InvalidURL as e:
+            # Not an httpx2.HTTPError: raised when the request is
+            # built, for a malformed port or host that urlparse (and
+            # so validate_egress_url) accepts. A broken URL can never
+            # succeed, so it must neither retry here nor escape to
+            # the retryable INTERNAL_ERROR catch-all.
+            raise BitonalError(
+                failed_code, f"invalid URL: {e}", status=400
+            ) from e
+        except (_TransientTransferError, httpx2.HTTPError) as e:
+            last_error = str(e)
+    raise BitonalError(
+        failed_code,
+        f"{failure_prefix} after {EGRESS_MAX_ATTEMPTS} attempts: {last_error}",
+        status=502,
+    )
+
+
+def stream_url_to_file(url: str, output_path: str) -> str:
+    """Download a presigned GET URL to a file, streaming.
+
+    Never buffers the body in memory: shards can reach hundreds of
+    megabytes while the pod's memory allowance is under 500 MiB.
+
+    :param url: Presigned GET URL of the input document.
+    :param output_path: Where to write the body.
+    :return: sha256 hex digest of the downloaded bytes.
+    :raises BitonalError: INPUT_URL_EXPIRED on 403, INPUT_TOO_LARGE
+        when the body exceeds DOCTOR_BITONAL_MAX_DOWNLOAD_BYTES,
+        INPUT_DOWNLOAD_FAILED otherwise.
+    """
+    validate_egress_url(url)
+    # Cap the download: input_url is caller-supplied and an oversized
+    # object would fill the pod's shared disk. Content-Length fails
+    # fast; the streamed count catches missing or lying headers. No
+    # retries — the object will not shrink.
+    max_bytes = settings.DOCTOR_BITONAL_MAX_DOWNLOAD_BYTES
+
+    def attempt() -> str:
+        with (
+            httpx2.Client(
+                http2=True, follow_redirects=False, timeout=EGRESS_TIMEOUT
+            ) as client,
+            client.stream("GET", url) as response,
+        ):
+            _classify_status(
+                response.status_code,
+                "INPUT_URL_EXPIRED",
+                "INPUT_DOWNLOAD_FAILED",
+                "input",
+            )
+            content_length = response.headers.get("Content-Length", "")
+            if (
+                max_bytes
+                and content_length.isdigit()
+                and int(content_length) > max_bytes
+            ):
+                raise BitonalError(
+                    "INPUT_TOO_LARGE",
+                    f"input Content-Length {content_length} exceeds "
+                    f"the {max_bytes}-byte limit",
+                    status=400,
+                )
+            digest = hashlib.sha256()
+            received = 0
+            with open(output_path, "wb") as f:
+                for chunk in response.iter_bytes(1024 * 1024):
+                    received += len(chunk)
+                    if max_bytes and received > max_bytes:
+                        raise BitonalError(
+                            "INPUT_TOO_LARGE",
+                            f"input exceeded the {max_bytes}-byte "
+                            "limit while streaming",
+                            status=400,
+                        )
+                    f.write(chunk)
+                    digest.update(chunk)
+            return digest.hexdigest()
+
+    return _transfer_with_retries(
+        attempt, "INPUT_DOWNLOAD_FAILED", "input download failed"
+    )
+
+
+def put_file_to_url(url: str, input_path: str, content_type: str) -> str:
+    """Upload a file to a presigned PUT URL, streaming.
+
+    A single PUT is atomic on S3: a partial upload never becomes a
+    gettable object, so the object's existence implies all of its
+    bytes are there. Content-Type is sent explicitly because the
+    presigned signature covers it; Content-Length keeps the body
+    unchunked. The digest is computed while streaming, mirroring
+    stream_url_to_file, so the caller never re-reads the file.
+
+    :param url: Presigned PUT URL for the result object.
+    :param input_path: File to upload.
+    :param content_type: Content type the URL was signed with.
+    :return: sha256 hex digest of the uploaded bytes.
+    :raises BitonalError: RESULT_URL_EXPIRED on 403,
+        RESULT_UPLOAD_FAILED otherwise.
+    """
+    validate_egress_url(url)
+    headers = {
+        "Content-Type": content_type,
+        "Content-Length": str(os.path.getsize(input_path)),
+    }
+
+    def attempt() -> str:
+        # A fresh digest per attempt: a retried upload re-reads the
+        # file from the start.
+        digest = hashlib.sha256()
+        with (
+            open(input_path, "rb") as f,
+            httpx2.Client(
+                http2=True, follow_redirects=False, timeout=EGRESS_TIMEOUT
+            ) as client,
+        ):
+
+            def hashing_body():
+                while chunk := f.read(1024 * 1024):
+                    digest.update(chunk)
+                    yield chunk
+
+            response = client.put(url, content=hashing_body(), headers=headers)
+        _classify_status(
+            response.status_code,
+            "RESULT_URL_EXPIRED",
+            "RESULT_UPLOAD_FAILED",
+            "output",
+        )
+        return digest.hexdigest()
+
+    return _transfer_with_retries(
+        attempt, "RESULT_UPLOAD_FAILED", "result upload failed"
+    )
+
+
+async def download_images(sorted_urls: list[str], dest_dir: str) -> list[str]:
+    """Stream images to ``dest_dir`` and return their paths in input order.
+
+    Caps concurrent downloads so a many-URL batch can't fan out an
+    unbounded number of in-flight requests. Each response is streamed
+    straight to disk so no image's bytes sit in RAM during the fetch.
+    Files larger than ``MAX_IMAGE_BYTES`` are still kept, but logged with
+    their final size and URL because img2pdf will load each one back
+    into memory when it builds the PDF.
 
     :param sorted_urls: List of sorted URLs for split financial disclosure
-    :return: image_list
+    :param dest_dir: Directory to write downloaded images into. The
+        caller owns its lifecycle (typically a ``TemporaryDirectory``).
+    :return: Filesystem paths of each image, in the same order as
+        ``sorted_urls``
     """
+    sem = asyncio.Semaphore(MAX_CONCURRENT_IMAGE_DOWNLOADS)
 
-    async def main(urls):
-        image_list = []
-        loop = asyncio.get_event_loop()
-        futures = [
-            loop.run_in_executor(None, requests.get, url) for url in urls
-        ]
-        for response in await asyncio.gather(*futures):
-            image_list.append(response.content)
-        return image_list
+    async def _fetch(client: AsyncClient, index: int, url: str) -> str:
+        path = os.path.join(dest_dir, f"{index:06d}")
+        size = 0
+        async with sem, client.stream("GET", url) as response:
+            response.raise_for_status()
+            with open(path, "wb") as f:
+                async for chunk in response.aiter_bytes():
+                    f.write(chunk)
+                    size += len(chunk)
+        if size > MAX_IMAGE_BYTES:
+            logger.warning(
+                "Image at %s is %s bytes, exceeding limit of %s; "
+                "img2pdf will load the full file into memory during "
+                "PDF construction",
+                url,
+                size,
+                MAX_IMAGE_BYTES,
+            )
+        return path
 
-    loop = asyncio.get_event_loop()
-    image_list = loop.run_until_complete(main(sorted_urls))
-
-    return image_list
+    async with AsyncClient(http2=True, follow_redirects=True) as client:
+        return await asyncio.gather(
+            *(_fetch(client, i, url) for i, url in enumerate(sorted_urls))
+        )
 
 
 # Audio
@@ -460,7 +860,9 @@ root = os.path.dirname(os.path.realpath(__file__))
 assets_dir = os.path.join(root, "assets")
 
 
-def convert_to_mp3(output_path: AnyStr, media: Any) -> None:
+async def convert_to_mp3[AnyStr: (bytes, str)](
+    output_path: AnyStr, media: Any
+) -> AnyStr:
     """Convert audio bytes to mp3 at temporary path
 
     :param output_path: Audio file bytes sent to Doctor
@@ -480,14 +882,19 @@ def convert_to_mp3(output_path: AnyStr, media: Any) -> None:
         output_path,
     ]
 
-    ffmpeg_cmd = subprocess.Popen(
-        av_command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, shell=False
+    ffmpeg_cmd = await asyncio.create_subprocess_exec(
+        *av_command,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        shell=False,
     )
-    ffmpeg_cmd.communicate(media.read())
+    await ffmpeg_cmd.communicate(media.read())
     return output_path
 
 
-def convert_to_ogg(output_path: AnyStr, media: Any) -> None:
+async def convert_to_ogg[AnyStr: (bytes, str)](
+    output_path: AnyStr, media: Any
+) -> AnyStr:
     """Converts audio data to the ogg format (.ogg)
 
     This function uses ffmpeg to convert the audio data provided in `media` to
@@ -521,14 +928,17 @@ def convert_to_ogg(output_path: AnyStr, media: Any) -> None:
         output_path,
     ]
 
-    ffmpeg_cmd = subprocess.Popen(
-        av_command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, shell=False
+    ffmpeg_cmd = await asyncio.create_subprocess_exec(
+        *av_command,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        shell=False,
     )
-    ffmpeg_cmd.communicate(media.read())
+    await ffmpeg_cmd.communicate(media.read())
     return output_path
 
 
-def set_mp3_meta_data(
+async def set_mp3_meta_data[AnyStr: (bytes, str)](
     audio_data: dict, mp3_path: AnyStr
 ) -> eyed3.core.AudioFile:
     """Set the metadata in audio_data to an mp3 at path.
@@ -540,6 +950,11 @@ def set_mp3_meta_data(
 
     # Load the file, delete the old tags and create a new one.
     audio_file = eyed3.load(mp3_path)
+    if audio_file is None:
+        # eyed3 returns None for a file it cannot parse as mp3. Say so
+        # here rather than letting every tag access below fail with an
+        # AttributeError on None.
+        raise ValueError(f"eyed3 could not load {mp3_path!r} as an mp3")
     # Undocumented API from eyed3.plugins.classic.ClassicPlugin#handleRemoves
     id3.Tag.remove(
         audio_file.tag.file_info.name,
@@ -576,7 +991,12 @@ def set_mp3_meta_data(
     ]
 
     if url:
-        seal_content = requests.get(url, timeout=30).content
+        async with AsyncClient(
+            http2=True, follow_redirects=True, timeout=30
+        ) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            seal_content = response.content
         audio_file.tag.images.set(
             3,
             seal_content,
@@ -599,7 +1019,7 @@ def set_mp3_meta_data(
     return audio_file
 
 
-def convert_to_base64(tmp_path: AnyStr) -> AnyStr:
+def convert_to_base64[AnyStr: (bytes, str)](tmp_path: AnyStr) -> str:
     """Convert file base64 and decode it.
 
     This allows us to safely return the file in json to CL.
